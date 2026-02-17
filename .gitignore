@@ -1,0 +1,11 @@
+# Build folders
+build/
+cmake-build-*/
+
+# OSM data (huge files)
+data/*.pbf
+data/*.osm
+data/*.xml
+
+# macOS junk
+.DS_Store
