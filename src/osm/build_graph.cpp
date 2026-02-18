@@ -1,22 +1,16 @@
-#include <osmium/io/any_input.hpp>
-#include <osmium/handler.hpp>
-#include <osmium/visitor.hpp>
-#include <osmium/osm/way.hpp>
-#include <osmium/osm/node.hpp>
-
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
+#include <fstream>
 #include <vector>
-#include <stdexcept>
+#include <queue>
+#include <limits>
+#include <string>
+#include <chrono>
+#include <cstdint>
+#include <cmath>
+#include <unordered_map>
+#include <algorithm>
 
-// ---------------- geo helpers ----------------
+// ---------- geo helpers ----------
 static inline double deg2rad(double d) { return d * M_PI / 180.0; }
 
 static double haversine_m(double lat1, double lon1, double lat2, double lon2) {
@@ -30,296 +24,223 @@ static double haversine_m(double lat1, double lon1, double lat2, double lon2) {
     return R * c;
 }
 
-// ---------------- road filters ----------------
-static bool is_drivable_highway(const osmium::Way& w) {
-    const char* h = w.tags()["highway"];
-    if (!h) return false;
-    const std::string hs(h);
-    return (hs == "motorway" ||
-            hs == "trunk" ||
-            hs == "primary" ||
-            hs == "secondary" ||
-            hs == "tertiary" ||
-            hs == "unclassified" ||
-            hs == "residential" ||
-            hs == "living_street" ||
-            hs == "service");
-}
-
-// ---------------- speed + oneway helpers ----------------
-// minimal, practical parser: grabs the first number in "35", "35 mph", "50 km/h", "signals", etc.
-static double parse_maxspeed_to_mps(const char* s) {
-    if (!s) return -1.0;
-    std::string v(s);
-    // common junk values
-    if (v == "signals" || v == "none" || v == "walk" || v == "variable") return -1.0;
-
-    // find first digit
-    size_t i = 0;
-    while (i < v.size() && !(v[i] >= '0' && v[i] <= '9')) i++;
-    if (i == v.size()) return -1.0;
-
-    // parse number (possibly with decimal)
-    size_t j = i;
-    while (j < v.size() && ((v[j] >= '0' && v[j] <= '9') || v[j] == '.')) j++;
-    double num = 0.0;
-    try {
-        num = std::stod(v.substr(i, j - i));
-    } catch (...) {
-        return -1.0;
-    }
-
-    // unit detection
-    // if it mentions mph -> mph, else assume km/h (OSM default is usually km/h unless explicitly mph)
-    bool mph = (v.find("mph") != std::string::npos) || (v.find("mp/h") != std::string::npos);
-    if (mph) return num * 0.44704;       // mph -> m/s
-    return num * (1000.0 / 3600.0);      // km/h -> m/s
-}
-
-static double default_speed_mps_from_highway(const osmium::Way& w) {
-    const char* h = w.tags()["highway"];
-    if (!h) return 13.89; // 50 km/h fallback
-    const std::string hs(h);
-
-    // simple, sane defaults (tweak later)
-    if (hs == "motorway")      return 30.56; // 110 km/h
-    if (hs == "trunk")         return 25.00; // 90 km/h
-    if (hs == "primary")       return 22.22; // 80 km/h
-    if (hs == "secondary")     return 19.44; // 70 km/h
-    if (hs == "tertiary")      return 16.67; // 60 km/h
-    if (hs == "unclassified")  return 13.89; // 50 km/h
-    if (hs == "residential")   return 11.11; // 40 km/h
-    if (hs == "living_street") return  5.56; // 20 km/h
-    if (hs == "service")       return  8.33; // 30 km/h
-    return 13.89;
-}
-
-static double speed_mps_for_way(const osmium::Way& w) {
-    // if maxspeed exists, use it; otherwise highway default
-    double ms = parse_maxspeed_to_mps(w.tags()["maxspeed"]);
-    if (ms > 0.0) return ms;
-    return default_speed_mps_from_highway(w);
-}
-
-// Return: 0 = bidirectional, +1 = forward only, -1 = reverse only
-static int oneway_dir(const osmium::Way& w) {
-    const char* o = w.tags()["oneway"];
-    if (!o) return 0;
-
-    std::string v(o);
-    for (auto& c : v) c = (char)std::tolower(c);
-
-    if (v == "yes" || v == "true" || v == "1") return +1;
-    if (v == "-1" || v == "reverse") return -1;
-    if (v == "no" || v == "false" || v == "0") return 0;
-
-    return 0;
-}
-
-// ---------------- pass 1 ----------------
-struct CollectNodeIDs : public osmium::handler::Handler {
-    std::unordered_set<osmium::object_id_type> needed;
-    void way(const osmium::Way& w) {
-        if (!is_drivable_highway(w)) return;
-        for (const auto& nr : w.nodes()) needed.insert(nr.ref());
-    }
+// ---------- CSR ----------
+struct CSR {
+    uint64_t N = 0;
+    uint64_t M = 0;
+    std::vector<uint64_t> node_ids;   // idx -> OSM node id
+    std::vector<double>   lat;        // idx -> lat
+    std::vector<double>   lon;        // idx -> lon
+    std::vector<uint64_t> off;        // size N+1
+    std::vector<uint32_t> to;         // size M
+    std::vector<float>    w;          // size M  (IMPORTANT: assumes SECONDS)
 };
 
-// ---------------- pass 2 ----------------
-struct Coord { double lat, lon; };
+static bool load_csr_v2(const std::string& path, CSR& g) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
 
-struct StoreCoords : public osmium::handler::Handler {
-    const std::unordered_set<osmium::object_id_type>& needed;
-    std::unordered_map<osmium::object_id_type, Coord> coords;
+    in.read(reinterpret_cast<char*>(&g.N), sizeof(g.N));
+    in.read(reinterpret_cast<char*>(&g.M), sizeof(g.M));
+    if (!in) return false;
 
-    explicit StoreCoords(const std::unordered_set<osmium::object_id_type>& n) : needed(n) {
-        coords.reserve(needed.size());
-    }
+    g.node_ids.resize(g.N);
+    g.lat.resize(g.N);
+    g.lon.resize(g.N);
+    g.off.resize(g.N + 1);
+    g.to.resize(g.M);
+    g.w.resize(g.M);
 
-    void node(const osmium::Node& n) {
-        auto id = n.id();
-        if (needed.find(id) == needed.end()) return;
-        if (!n.location()) return;
-        coords[id] = { n.location().lat(), n.location().lon() };
-    }
+    in.read(reinterpret_cast<char*>(g.node_ids.data()), sizeof(uint64_t) * g.N);
+    in.read(reinterpret_cast<char*>(g.lat.data()),      sizeof(double)   * g.N);
+    in.read(reinterpret_cast<char*>(g.lon.data()),      sizeof(double)   * g.N);
+
+    in.read(reinterpret_cast<char*>(g.off.data()),      sizeof(uint64_t) * (g.N + 1));
+    in.read(reinterpret_cast<char*>(g.to.data()),       sizeof(uint32_t) * g.M);
+    in.read(reinterpret_cast<char*>(g.w.data()),        sizeof(float)    * g.M);
+
+    if (!in) return false;
+    if (g.off.empty() || g.off.back() != g.M) return false;
+    return true;
+}
+
+static std::unordered_map<uint64_t, uint32_t> build_osm_to_idx(const CSR& g) {
+    std::unordered_map<uint64_t, uint32_t> mp;
+    mp.reserve(static_cast<size_t>(g.N * 1.3));
+    for (uint32_t i = 0; i < static_cast<uint32_t>(g.N); ++i) mp[g.node_ids[i]] = i;
+    return mp;
+}
+
+// ---------- A* ----------
+struct PQItem {
+    double f;
+    uint32_t v;
+    bool operator>(const PQItem& o) const { return f > o.f; }
 };
 
-// ---------------- pass 3 (CSR build) ----------------
-struct EdgeRec { uint32_t from, to; float w_sec; };
+// Returns: true if found path. dist_out is total COST (seconds).
+static bool astar_seconds(
+    const CSR& g,
+    uint32_t s,
+    uint32_t t,
+    std::vector<uint32_t>& parent_out,
+    double& dist_out_seconds
+) {
+    const double INF = std::numeric_limits<double>::infinity();
+    std::vector<double> gscore(g.N, INF);
+    std::vector<uint32_t> parent(g.N, UINT32_MAX);
 
-int main() {
-    try {
-        const std::string pbf_path = "../data/region.osm.pbf";
-        const std::string out_path = "../data/out/graph_csr.bin";
+    // Heuristic must be in SAME UNITS as edge weights.
+    // Your w[] is seconds, so h() should return seconds.
+    // We approximate by straight-line meters / max_speed_mps.
+    constexpr double MAX_SPEED_MPS = 33.33; // ~120 km/h (admissible-ish upper bound)
 
-        // PASS 1
-        osmium::io::Reader r1(pbf_path);
-        CollectNodeIDs pass1;
-        osmium::apply(r1, pass1);
-        r1.close();
-        std::cout << "Pass1: needed node IDs = " << pass1.needed.size() << "\n";
+    auto h = [&](uint32_t v) -> double {
+        double meters = haversine_m(g.lat[v], g.lon[v], g.lat[t], g.lon[t]);
+        return meters / MAX_SPEED_MPS;
+    };
 
-        // PASS 2
-        osmium::io::Reader r2(pbf_path);
-        StoreCoords pass2(pass1.needed);
-        osmium::apply(r2, pass2);
-        r2.close();
-        std::cout << "Pass2: coords stored = " << pass2.coords.size() << "\n";
+    std::priority_queue<PQItem, std::vector<PQItem>, std::greater<PQItem>> pq;
 
-        // Build compact index using ONLY nodes that have coords
-        std::vector<uint64_t> node_ids;
-        node_ids.reserve(pass2.coords.size());
-        for (const auto& kv : pass2.coords) node_ids.push_back((uint64_t)kv.first);
-        std::sort(node_ids.begin(), node_ids.end());
+    gscore[s] = 0.0;
+    pq.push({h(s), s});
 
-        std::unordered_map<osmium::object_id_type, uint32_t> id_to_idx;
-        id_to_idx.reserve((size_t)(node_ids.size() * 1.3));
-        for (uint32_t i = 0; i < (uint32_t)node_ids.size(); ++i) {
-            id_to_idx[(osmium::object_id_type)node_ids[i]] = i;
-        }
+    while (!pq.empty()) {
+        auto cur = pq.top();
+        pq.pop();
+        uint32_t v = cur.v;
 
-        const uint64_t N = node_ids.size();
-        std::cout << "Index: N = " << N << "\n";
+        if (v == t) break;
 
-        // Build lat/lon arrays aligned with node_ids[]
-        std::vector<double> lat(N), lon(N);
-        for (uint64_t i = 0; i < N; ++i) {
-            auto it = pass2.coords.find((osmium::object_id_type)node_ids[i]);
-            if (it == pass2.coords.end()) throw std::runtime_error("Internal: coord missing for node id");
-            lat[i] = it->second.lat;
-            lon[i] = it->second.lon;
-        }
+        uint64_t begin = g.off[v];
+        uint64_t end   = g.off[v + 1];
 
-        // PASS 3: build directed edges with weight = travel_time_seconds
-        std::vector<uint64_t> deg(N, 0);
-        std::vector<EdgeRec> edges;
-        edges.reserve(3'000'000);
-
-        struct Builder : public osmium::handler::Handler {
-            const std::unordered_map<osmium::object_id_type, Coord>& coords;
-            const std::unordered_map<osmium::object_id_type, uint32_t>& id_to_idx;
-            std::vector<uint64_t>& deg;
-            std::vector<EdgeRec>& edges;
-
-            uint64_t ways_used = 0;
-            uint64_t directed_edges_added = 0;
-
-            Builder(const std::unordered_map<osmium::object_id_type, Coord>& c,
-                    const std::unordered_map<osmium::object_id_type, uint32_t>& m,
-                    std::vector<uint64_t>& d,
-                    std::vector<EdgeRec>& e)
-                : coords(c), id_to_idx(m), deg(d), edges(e) {}
-
-            void add_dir(uint32_t a, uint32_t b, float sec) {
-                deg[a]++;
-                edges.push_back({a, b, sec});
-                directed_edges_added++;
+        for (uint64_t ei = begin; ei < end; ++ei) {
+            uint32_t u = g.to[ei];
+            double cand = gscore[v] + static_cast<double>(g.w[ei]); // seconds
+            if (cand < gscore[u]) {
+                gscore[u] = cand;
+                parent[u] = v;
+                pq.push({cand + h(u), u});
             }
-
-            void way(const osmium::Way& w0) {
-                if (!is_drivable_highway(w0)) return;
-                if (w0.nodes().size() < 2) return;
-
-                ++ways_used;
-
-                const int od = oneway_dir(w0);         // 0, +1, -1
-                const double speed = speed_mps_for_way(w0); // m/s
-
-                auto it = w0.nodes().begin();
-                osmium::object_id_type prev_id = it->ref();
-                ++it;
-
-                for (; it != w0.nodes().end(); ++it) {
-                    osmium::object_id_type cur_id = it->ref();
-
-                    auto p = coords.find(prev_id);
-                    auto q = coords.find(cur_id);
-                    if (p != coords.end() && q != coords.end()) {
-                        auto ip = id_to_idx.find(prev_id);
-                        auto iq = id_to_idx.find(cur_id);
-
-                        if (ip != id_to_idx.end() && iq != id_to_idx.end()) {
-                            double meters = haversine_m(p->second.lat, p->second.lon,
-                                                       q->second.lat, q->second.lon);
-                            double sec = meters / std::max(0.1, speed); // avoid divide by 0
-                            float wsec = (float)sec;
-
-                            // od meaning:
-                            // 0  => both directions
-                            // +1 => follow node order prev->cur only
-                            // -1 => reverse only cur->prev
-                            if (od == 0) {
-                                add_dir(ip->second, iq->second, wsec);
-                                add_dir(iq->second, ip->second, wsec);
-                            } else if (od == +1) {
-                                add_dir(ip->second, iq->second, wsec);
-                            } else { // -1
-                                add_dir(iq->second, ip->second, wsec);
-                            }
-                        }
-                    }
-
-                    prev_id = cur_id;
-                }
-            }
-        };
-
-        osmium::io::Reader r3(pbf_path);
-        Builder builder(pass2.coords, id_to_idx, deg, edges);
-        osmium::apply(r3, builder);
-        r3.close();
-
-        const uint64_t M = edges.size();
-        std::cout << "Pass3: ways used = " << builder.ways_used << "\n";
-        std::cout << "Graph: directed edges added = " << builder.directed_edges_added << "\n";
-
-        // Build offsets
-        std::vector<uint64_t> offsets(N + 1, 0);
-        for (uint64_t i = 0; i < N; ++i) offsets[i + 1] = offsets[i] + deg[i];
-        if (offsets[N] != M) throw std::runtime_error("Degree sum mismatch vs edges.size()");
-
-        // Pack CSR
-        std::vector<uint64_t> cursor = offsets;
-        std::vector<uint32_t> csr_to(M);
-        std::vector<float> csr_w(M);
-
-        for (const auto& e : edges) {
-            uint64_t pos = cursor[e.from]++;
-            csr_to[pos] = e.to;
-            csr_w[pos]  = e.w_sec;
         }
+    }
 
-        double avg_deg = (N == 0) ? 0.0 : (double)M / (double)N;
-        std::cout << "Graph: N=" << N << " M=" << M << " avg out-deg=" << avg_deg << "\n";
+    if (!std::isfinite(gscore[t])) return false;
+    parent_out = std::move(parent);
+    dist_out_seconds = gscore[t];
+    return true;
+}
 
-        std::filesystem::create_directories("../data/out");
+static std::vector<uint32_t> reconstruct_path(
+    const std::vector<uint32_t>& parent,
+    uint32_t s,
+    uint32_t t
+) {
+    std::vector<uint32_t> rev;
+    for (uint32_t cur = t; cur != UINT32_MAX; cur = parent[cur]) {
+        rev.push_back(cur);
+        if (cur == s) break;
+    }
+    if (rev.empty() || rev.back() != s) return {};
+    return std::vector<uint32_t>(rev.rbegin(), rev.rend());
+}
 
-        // Write v2 binary WITH coords (same layout your route_graph loader expects)
-        {
-            std::ofstream out(out_path, std::ios::binary);
-            if (!out) throw std::runtime_error("Failed to open output: " + out_path);
+static double path_distance_m(const CSR& g, const std::vector<uint32_t>& path) {
+    if (path.size() < 2) return 0.0;
+    double total = 0.0;
+    for (size_t i = 1; i < path.size(); ++i) {
+        uint32_t a = path[i - 1];
+        uint32_t b = path[i];
+        total += haversine_m(g.lat[a], g.lon[a], g.lat[b], g.lon[b]);
+    }
+    return total;
+}
 
-            auto write_u64 = [&](uint64_t v){ out.write((const char*)&v, sizeof(v)); };
-
-            write_u64(N);
-            write_u64(M);
-
-            out.write((const char*)node_ids.data(), sizeof(uint64_t) * N);
-            out.write((const char*)lat.data(),     sizeof(double)   * N);
-            out.write((const char*)lon.data(),     sizeof(double)   * N);
-
-            out.write((const char*)offsets.data(), sizeof(uint64_t) * (N + 1));
-            out.write((const char*)csr_to.data(),  sizeof(uint32_t) * M);
-            out.write((const char*)csr_w.data(),   sizeof(float)    * M);
-
-            if (!out) throw std::runtime_error("Write failed (disk?)");
-        }
-
-        std::cout << "Wrote CSR graph (+coords, time weights) to: " << out_path << "\n";
-        return 0;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << "\n";
+int main(int argc, char** argv) {
+    // Usage:
+    //   ./route_graph <start_osm_id> <end_osm_id>
+    if (argc != 3) {
+        std::cerr << "Usage: ./route_graph <start_osm_id> <end_osm_id>\n";
         return 1;
     }
+
+    uint64_t start_osm = 0, end_osm = 0;
+    try {
+        start_osm = static_cast<uint64_t>(std::stoull(argv[1]));
+        end_osm   = static_cast<uint64_t>(std::stoull(argv[2]));
+    } catch (...) {
+        std::cerr << "Error: arguments must be integers (OSM node ids).\n";
+        return 1;
+    }
+
+    const std::string bin = "../data/out/graph_csr.bin";
+
+    CSR g;
+    if (!load_csr_v2(bin, g)) {
+        std::cerr << "Error: failed to load v2 CSR from " << bin << "\n";
+        std::cerr << "Tip: run ./build_graph again, then ./load_graph to verify.\n";
+        return 1;
+    }
+
+    auto osm2idx = build_osm_to_idx(g);
+    auto itS = osm2idx.find(start_osm);
+    auto itT = osm2idx.find(end_osm);
+    if (itS == osm2idx.end() || itT == osm2idx.end()) {
+        std::cerr << "Error: start or end OSM id not found in graph.\n";
+        std::cerr << "Tip: use ./load_graph output or your python snippet to grab valid IDs.\n";
+        return 1;
+    }
+
+    uint32_t s = itS->second;
+    uint32_t t = itT->second;
+
+    std::vector<uint32_t> parent;
+    double best_time_sec = 0.0;
+
+    auto t0 = std::chrono::steady_clock::now();
+    bool ok = astar_seconds(g, s, t, parent, best_time_sec);
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    std::cout << "N = " << g.N << ", M = " << g.M << "\n";
+
+    if (!ok) {
+        std::cout << "No path found.\n";
+        std::cout << "Runtime: " << ms << " ms\n";
+        return 0;
+    }
+
+    auto path = reconstruct_path(parent, s, t);
+    if (path.empty()) {
+        std::cout << "No path found (reconstruct failed).\n";
+        std::cout << "Runtime: " << ms << " ms\n";
+        return 0;
+    }
+
+    // Compute geometric distance for reporting (km)
+    double dist_m = path_distance_m(g, path);
+    double dist_km = dist_m / 1000.0;
+
+    // Time reporting
+    double time_min = best_time_sec / 60.0;
+
+    std::cout << "Travel time: " << time_min << " minutes\n";
+    std::cout << "Distance: " << dist_km << " km\n";
+    std::cout << "Hops: " << path.size() << " nodes\n";
+    std::cout << "Runtime: " << ms << " ms\n";
+    std::cout << "Start OSM: " << start_osm << "\n";
+    std::cout << "End OSM:   " << end_osm << "\n";
+
+    // Path preview (don’t spam)
+    std::cout << "Path preview (OSM ids):\n";
+    size_t preview = std::min<size_t>(path.size(), 15);
+    for (size_t i = 0; i < preview; ++i) {
+        std::cout << "  " << g.node_ids[path[i]] << "\n";
+    }
+    if (path.size() > preview) {
+        std::cout << "  ... (" << (path.size() - preview) << " more)\n";
+    }
+
+    return 0;
 }
