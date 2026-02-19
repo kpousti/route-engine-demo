@@ -9,18 +9,55 @@
   rel="stylesheet"
   href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
 />
-
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
 <style>
   body { margin: 0; }
   #map { height: 100vh; }
+
+  /* --- Stats overlay --- */
+  .stats-box {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 1000;
+    background: rgba(0,0,0,0.75);
+    color: #fff;
+    padding: 10px 12px;
+    border-radius: 10px;
+    font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    min-width: 220px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  }
+  .stats-box .title {
+    font-weight: 700;
+    margin-bottom: 6px;
+    font-size: 14px;
+  }
+  .stats-box .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 2px 0;
+  }
+  .stats-box .k { opacity: 0.85; }
+  .stats-box .v { font-variant-numeric: tabular-nums; }
 </style>
 </head>
 
 <body>
-
 <div id="map"></div>
+
+<!-- Stats box -->
+<div id="stats" class="stats-box" style="display:none;">
+  <div class="title">Route Stats</div>
+  <div class="row"><div class="k">Travel time</div><div class="v" id="st_time">—</div></div>
+  <div class="row"><div class="k">Distance</div><div class="v" id="st_dist">—</div></div>
+  <div class="row"><div class="k">Hops</div><div class="v" id="st_hops">—</div></div>
+  <div class="row"><div class="k">Runtime</div><div class="v" id="st_runtime">—</div></div>
+  <div class="row"><div class="k">Start OSM</div><div class="v" id="st_start">—</div></div>
+  <div class="row"><div class="k">End OSM</div><div class="v" id="st_end">—</div></div>
+</div>
 
 <script>
 const map = L.map('map').setView([21.27, -157.82], 13);
@@ -29,21 +66,123 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
 }).addTo(map);
 
-fetch('route.geojson')
-  .then(response => response.json())
-  .then(data => {
-    const layer = L.geoJSON(data, {
-      style: {
-        color: 'red',
-        weight: 5
-      }
-    }).addTo(map);
+function fmtKm(km) {
+  if (!isFinite(km)) return "—";
+  return km >= 10 ? km.toFixed(1) + " km" : km.toFixed(3) + " km";
+}
+function fmtMs(ms) {
+  if (!isFinite(ms)) return "—";
+  return ms.toFixed(2) + " ms";
+}
+function fmtMin(min) {
+  if (!isFinite(min)) return "—";
+  return min.toFixed(2) + " min";
+}
 
-    map.fitBounds(layer.getBounds());
+/* ---------------------------
+   NEW: click-to-drop markers
+----------------------------*/
+let startMarker = null;
+let endMarker = null;
+
+function clearMarkers() {
+  if (startMarker) map.removeLayer(startMarker);
+  if (endMarker) map.removeLayer(endMarker);
+  startMarker = null;
+  endMarker = null;
+}
+
+// left click sets start then end
+map.on('click', (e) => {
+  const { lat, lng } = e.latlng;
+
+  if (!startMarker) {
+    startMarker = L.marker([lat, lng]).addTo(map).bindPopup("Start").openPopup();
+    console.log("Start chosen:", lat, lng);
+    return;
+  }
+
+  if (!endMarker) {
+    endMarker = L.marker([lat, lng]).addTo(map).bindPopup("End").openPopup();
+    console.log("End chosen:", lat, lng);
+
+    // NEXT STEP (later): call your backend here to reroute automatically
+    // Example we’ll do later:
+    // fetch(`/route?slat=${start.lat}&slon=${start.lng}&tlat=${end.lat}&tlon=${end.lng}`)
+    //   .then(r=>r.json()).then(drawGeoJSON)
+
+    return;
+  }
+
+  // third click resets
+  clearMarkers();
+});
+
+// right click (contextmenu) clears markers
+map.on('contextmenu', () => {
+  clearMarkers();
+});
+/* ---------------------------
+   end markers code
+----------------------------*/
+
+// Holds current GeoJSON layer so we can replace later (for backend step)
+let geoLayer = null;
+
+function drawGeoJSON(fc) {
+  if (geoLayer) map.removeLayer(geoLayer);
+
+  geoLayer = L.geoJSON(fc, {
+    style: (feature) => {
+      if (feature.geometry && feature.geometry.type === "LineString") {
+        return { color: 'red', weight: 5 };
+      }
+      return {};
+    },
+    pointToLayer: (feature, latlng) => L.marker(latlng)
+  }).addTo(map);
+
+  map.fitBounds(geoLayer.getBounds());
+
+  const routeFeature = (fc.features || []).find(f =>
+    f.geometry && f.geometry.type === "LineString"
+  );
+
+  if (routeFeature && routeFeature.properties) {
+    const p = routeFeature.properties;
+
+    document.getElementById('st_dist').textContent = fmtKm(Number(p.distance_km));
+    document.getElementById('st_hops').textContent = (p.hops ?? "—");
+    document.getElementById('st_runtime').textContent = fmtMs(Number(p.runtime_ms));
+    document.getElementById('st_start').textContent = (p.start_osm ?? "—");
+    document.getElementById('st_end').textContent = (p.end_osm ?? "—");
+
+    if (p.travel_time_min != null) {
+      document.getElementById('st_time').textContent = fmtMin(Number(p.travel_time_min));
+    } else if (p.travel_time_sec != null) {
+      document.getElementById('st_time').textContent = fmtMin(Number(p.travel_time_sec) / 60.0);
+    } else if (p.time_min != null) {
+      document.getElementById('st_time').textContent = fmtMin(Number(p.time_min));
+    } else if (p.time_sec != null) {
+      document.getElementById('st_time').textContent = fmtMin(Number(p.time_sec) / 60.0);
+    } else {
+      document.getElementById('st_time').textContent = "—";
+    }
+
+    document.getElementById('stats').style.display = "block";
+  } else {
+    console.warn("No LineString route feature found to extract stats.");
+  }
+}
+
+// initial load (same as before)
+fetch('route.geojson')
+  .then(r => {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
   })
-  .catch(err => {
-    console.error("Failed to load GeoJSON:", err);
-  });
+  .then(fc => drawGeoJSON(fc))
+  .catch(err => console.error("Failed to load GeoJSON:", err));
 </script>
 
 </body>
