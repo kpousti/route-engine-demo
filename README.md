@@ -99,8 +99,10 @@ Leaflet Frontend
 
 ## Simplification Example
 
-simp_m = 0   → 82 points  
-simp_m = 50  → 9 points  
+| simp_m | Output Points |
+|--------|--------------|
+| 0      | 82           |
+| 50     | 9            |
 
 Increasing simplification reduces payload size while preserving topology.
 
@@ -217,5 +219,6 @@ The same algorithmic patterns appear anywhere large graphs require fast, determi
 ---
 
 Generated graph binaries are intentionally excluded from version control.
+
 
 
