@@ -1,7 +1,18 @@
-# Route Engine (C++)  
+# Route Engine (C++)
+
 Offline A* Routing + Interactive Geospatial Visualization
 
 A high-performance routing engine built from scratch in modern C++.
+
+---
+
+## Demo
+
+![Route Engine Demo](docs/route-engine-demo.png)
+
+---
+
+## Overview
 
 This project parses OpenStreetMap data into a compressed graph representation, executes A* shortest-path search with spatial snapping, exposes a hardened HTTP API, and renders interactive routes through a Leaflet frontend with live simplification controls.
 
@@ -55,7 +66,9 @@ GeoJSON Response
    ↓  
 Leaflet Frontend  
 
-Core capabilities:
+---
+
+## Core Capabilities
 
 - Graph construction from OpenStreetMap data  
 - CSR-style adjacency structure for cache-friendly traversal  
@@ -68,10 +81,10 @@ Core capabilities:
 
 ---
 
-## Example
+## Simplification Example
 
-`simp_m = 0`   → 82 points  
-`simp_m = 50`  → 9 points  
+simp_m = 0   → 82 points  
+simp_m = 50  → 9 points  
 
 Increasing simplification reduces payload size while preserving topology.
 
@@ -79,21 +92,21 @@ Increasing simplification reduces payload size while preserving topology.
 
 ## API
 
-### Health
-GET `/health`
+Health  
+GET /health  
 
-### Reverse Geocode
-GET `/reverse?lat=...&lon=...`
+Reverse Geocode  
+GET /reverse?lat=...&lon=...  
 
-### Route
-GET `/route?slat=...&slon=...&elat=...&elon=...&simp_m=...`
+Route  
+GET /route?slat=...&slon=...&elat=...&elon=...&simp_m=...  
 
-Returns a GeoJSON `FeatureCollection` including:
+Returns a GeoJSON FeatureCollection including:
 
 - distance_km  
 - runtime_ms  
 - hops  
-- travel_time_min (if available)  
+- travel_time_min  
 - simp_m  
 - points  
 - start_label  
@@ -110,36 +123,51 @@ Input validation ensures malformed coordinates and invalid parameters are reject
 - C++17 compatible compiler  
 - CMake ≥ 3.16  
 - macOS or Linux  
-- OpenSSL (optional, for HTTPS reverse geocoding)  
 - OpenStreetMap `.pbf` file for graph generation  
+
+---
 
 ### Build
 
-```bash
-cmake -S . -B build
-cmake --build build -j
-```
+cmake -S . -B build  
+cmake --build build -j  
 
-### Run
+---
 
-```bash
-./build/route_server
-```
+### Generate Graph (Required First Run)
+
+Place your `.pbf` file inside `data/`
+
+cd build  
+./build_graph ../data/region.osm.pbf ../data/out  
+cd ..
+
+This creates:
+
+data/out/graph_csr.bin  
+
+(Graph binaries are intentionally excluded from version control.)
+
+---
+
+### Run Server
+
+./build/route_server  
 
 Server runs at:
 
-http://localhost:8080
+http://localhost:8080  
 
 Open the interactive demo:
 
-`data/out/map.html`
+data/out/map.html  
 
 ---
 
 ## Design Decisions
 
-- **A\*** reduces search space compared to plain Dijkstra  
-- **CSR layout** improves memory locality and traversal speed  
+- A* reduces search space compared to plain Dijkstra  
+- CSR layout improves memory locality and traversal speed  
 - Backend returns only LineString; UI owns marker state  
 - Explicit simplification controls payload and rendering cost  
 - Reverse geocode responses are cached in memory  
