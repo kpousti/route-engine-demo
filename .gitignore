@@ -1,11 +1,56 @@
-# Build folders
+# =========================
+# Build / CMake
+# =========================
 build/
-cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
 
-# OSM data (huge files)
-data/*.pbf
-data/*.osm
-data/*.xml
+# Object / binary files
+*.o
+*.a
+*.so
+*.out
+*.exe
+*.dll
+*.dylib
 
-# macOS junk
+# =========================
+# Generated Graph Binaries
+# (DO NOT commit large graph outputs)
+# =========================
+data/out/*.bin
+
+# =========================
+# Large OSM Data (huge)
+# =========================
+data/*.osm.pbf
+data/**/*.osm.pbf
+
+# =========================
+# Local Test Files
+# =========================
+a.json
+b.json
+c.json
+test.json
+*.log
+
+# =========================
+# macOS
+# =========================
 .DS_Store
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Misc
+# =========================
+*.swp
+*.tmp
