@@ -19,7 +19,22 @@ This project parses OpenStreetMap data into a compressed graph representation, e
 Built to deeply understand how real-world routing systems work — not just how to call them.
 
 ---
+## Quick Start
 
+```bash
+git clone https://github.com/kpousti/route-engine-demo.git
+cd route-engine-demo
+
+cmake -S . -B build
+cmake --build build -j
+
+# Generate graph (first run only)
+cd build
+./build_graph ../data/region.osm.pbf ../data/out
+cd ..
+
+# Run server
+./build/route_server
 ## Why I Built This
 
 Routing systems sit at the intersection of:
@@ -201,3 +216,4 @@ The same algorithmic patterns appear anywhere large graphs require fast, determi
 ---
 
 Generated graph binaries are intentionally excluded from version control.
+
