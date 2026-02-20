@@ -35,6 +35,7 @@ cd ..
 
 # Run server
 ./build/route_server
+```
 ## Why I Built This
 
 Routing systems sit at the intersection of:
@@ -216,4 +217,5 @@ The same algorithmic patterns appear anywhere large graphs require fast, determi
 ---
 
 Generated graph binaries are intentionally excluded from version control.
+
 
