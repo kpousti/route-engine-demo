@@ -15,6 +15,69 @@
   body { margin: 0; }
   #map { height: 100vh; }
 
+  /* --- Top-left controls --- */
+  .controls-box {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    z-index: 1100;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+
+    background: rgba(0,0,0,0.60);
+    color: #fff;
+    padding: 10px 12px;
+    border-radius: 10px;
+    font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+    user-select: none;
+  }
+
+  .controls-box button {
+    border: 0;
+    border-radius: 10px;
+    padding: 8px 10px;
+    cursor: pointer;
+    font-weight: 700;
+  }
+
+  .controls-box .hint {
+    opacity: 0.9;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .slider-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    white-space: nowrap;
+  }
+  .slider-wrap label {
+    opacity: 0.95;
+    font-weight: 600;
+  }
+  .slider-wrap input[type="range"] {
+    width: 140px;
+  }
+  .slider-wrap .val {
+    min-width: 40px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.95;
+  }
+
+  .status {
+    opacity: 0.95;
+    font-weight: 700;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.12);
+  }
+  .status.hidden { display: none; }
+
   /* --- Stats overlay --- */
   .stats-box {
     position: absolute;
@@ -26,7 +89,7 @@
     padding: 10px 12px;
     border-radius: 10px;
     font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-    min-width: 220px;
+    min-width: 260px;
     box-shadow: 0 8px 24px rgba(0,0,0,0.25);
   }
   .stats-box .title {
@@ -41,12 +104,34 @@
     margin: 2px 0;
   }
   .stats-box .k { opacity: 0.85; }
-  .stats-box .v { font-variant-numeric: tabular-nums; }
+  .stats-box .v {
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    max-width: 340px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 </style>
 </head>
 
 <body>
 <div id="map"></div>
+
+<!-- Top-left controls -->
+<div id="controls" class="controls-box">
+  <button id="btnNewRoute" type="button">New Route</button>
+
+  <div class="slider-wrap">
+    <label for="simpRange">Smoothing</label>
+    <input id="simpRange" type="range" min="0" max="50" step="1" value="3" />
+    <div class="val"><span id="simpVal">3</span> m</div>
+  </div>
+
+  <div id="status" class="status hidden">Loading…</div>
+
+  <div class="hint">Left click: Start → End · Right click: Clear</div>
+</div>
 
 <!-- Stats box -->
 <div id="stats" class="stats-box" style="display:none;">
@@ -55,8 +140,10 @@
   <div class="row"><div class="k">Distance</div><div class="v" id="st_dist">—</div></div>
   <div class="row"><div class="k">Hops</div><div class="v" id="st_hops">—</div></div>
   <div class="row"><div class="k">Runtime</div><div class="v" id="st_runtime">—</div></div>
-  <div class="row"><div class="k">Start OSM</div><div class="v" id="st_start">—</div></div>
-  <div class="row"><div class="k">End OSM</div><div class="v" id="st_end">—</div></div>
+  <div class="row"><div class="k">Simplify</div><div class="v" id="st_simp">—</div></div>
+  <div class="row"><div class="k">Points</div><div class="v" id="st_pts">—</div></div>
+  <div class="row"><div class="k">Start</div><div class="v" id="st_start">—</div></div>
+  <div class="row"><div class="k">End</div><div class="v" id="st_end">—</div></div>
 </div>
 
 <script>
@@ -65,6 +152,29 @@ const map = L.map('map').setView([21.27, -157.82], 13);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
 }).addTo(map);
+
+// Prevent clicking/dragging on the controls from interacting with the map
+const controlsEl = document.getElementById('controls');
+L.DomEvent.disableClickPropagation(controlsEl);
+L.DomEvent.disableScrollPropagation(controlsEl);
+
+// Status pill
+const statusEl = document.getElementById('status');
+function setLoading(on) {
+  statusEl.classList.toggle('hidden', !on);
+}
+
+// Track user interaction so smoothing doesn’t keep “yoinking” the camera
+let userMovedMap = false;
+map.on('dragstart', () => userMovedMap = true);
+map.on('zoomstart', () => userMovedMap = true);
+
+// --- Smoothing slider state ---
+const simpRange = document.getElementById('simpRange');
+const simpValEl = document.getElementById('simpVal');
+
+let SIMPLIFY_METERS = Number(simpRange.value) || 0;
+simpValEl.textContent = String(SIMPLIFY_METERS);
 
 function fmtKm(km) {
   if (!isFinite(km)) return "—";
@@ -80,7 +190,125 @@ function fmtMin(min) {
 }
 
 /* ---------------------------
-   NEW: click-to-drop markers
+   Route drawing + stats
+----------------------------*/
+let routeLayer = null;
+
+function clearRouteAndStats() {
+  if (routeLayer) map.removeLayer(routeLayer);
+  routeLayer = null;
+  document.getElementById('stats').style.display = "none";
+}
+
+function findLineStringFeature(fc) {
+  return (fc && fc.features ? fc.features : [])
+    .find(f => f && f.geometry && f.geometry.type === "LineString");
+}
+
+function drawRouteOnly(fc, { fit = true } = {}) {
+  const line = findLineStringFeature(fc);
+  if (!line) {
+    console.warn("No LineString feature found.");
+    return;
+  }
+
+  clearRouteAndStats();
+
+  routeLayer = L.geoJSON(line, {
+    style: () => ({ color: 'red', weight: 5 })
+  }).addTo(map);
+
+  if (fit) map.fitBounds(routeLayer.getBounds());
+
+  const p = line.properties || {};
+  const coords = (line.geometry && line.geometry.coordinates) ? line.geometry.coordinates : [];
+  const pts = coords.length;
+
+  document.getElementById('st_dist').textContent = fmtKm(Number(p.distance_km));
+  document.getElementById('st_hops').textContent = (p.hops ?? "—");
+  document.getElementById('st_runtime').textContent = fmtMs(Number(p.runtime_ms));
+
+  // These two are the “slider proof” fields:
+  document.getElementById('st_simp').textContent = `${p.simp_m ?? SIMPLIFY_METERS} m`;
+  document.getElementById('st_pts').textContent  = `${p.points ?? pts}`;
+
+  document.getElementById('st_start').textContent = (p.start_label ?? p.start_osm ?? "—");
+  document.getElementById('st_end').textContent   = (p.end_label   ?? p.end_osm   ?? "—");
+
+  if (p.travel_time_min != null) {
+    document.getElementById('st_time').textContent = fmtMin(Number(p.travel_time_min));
+  } else if (p.travel_time_sec != null) {
+    document.getElementById('st_time').textContent = fmtMin(Number(p.travel_time_sec) / 60.0);
+  } else if (p.time_min != null) {
+    document.getElementById('st_time').textContent = fmtMin(Number(p.time_min));
+  } else if (p.time_sec != null) {
+    document.getElementById('st_time').textContent = fmtMin(Number(p.time_sec) / 60.0);
+  } else {
+    document.getElementById('st_time').textContent = "—";
+  }
+
+  document.getElementById('stats').style.display = "block";
+}
+
+/* ---------------------------
+   Request canceling + caching + “don’t refit on smoothing”
+----------------------------*/
+let fetchController = null;
+let requestSeq = 0;
+
+// Cache: key = rounded coords + simp_m
+const routeCache = new Map();
+function cacheKey(slat, slon, elat, elon, simp) {
+  const r = (x) => Number(x).toFixed(6);
+  return `${r(slat)},${r(slon)}|${r(elat)},${r(elon)}|simp=${simp}`;
+}
+
+async function requestRouteFromBackend(slat, slon, elat, elon, { fit = true } = {}) {
+  const key = cacheKey(slat, slon, elat, elon, SIMPLIFY_METERS);
+
+  // Instant draw if cached
+  if (routeCache.has(key)) {
+    drawRouteOnly(routeCache.get(key), { fit });
+    return;
+  }
+
+  // Cancel previous in-flight request
+  if (fetchController) fetchController.abort();
+  fetchController = new AbortController();
+
+  const mySeq = ++requestSeq;
+
+  const url =
+    `http://localhost:8080/route?slat=${slat}&slon=${slon}` +
+    `&elat=${elat}&elon=${elon}` +
+    `&simp_m=${SIMPLIFY_METERS}`;
+
+  setLoading(true);
+
+  try {
+    const r = await fetch(url, { signal: fetchController.signal });
+    const data = await r.json().catch(() => null);
+
+    if (mySeq !== requestSeq) return; // ignore stale response
+
+    if (!r.ok) {
+      console.error("Backend HTTP error:", r.status, data);
+      throw new Error("Backend HTTP " + r.status);
+    }
+    if (!data || data.type !== "FeatureCollection") {
+      console.error("Backend returned non-GeoJSON:", data);
+      throw new Error("Backend did not return GeoJSON FeatureCollection");
+    }
+
+    routeCache.set(key, data);
+    drawRouteOnly(data, { fit });
+  } finally {
+    if (mySeq === requestSeq) setLoading(false);
+  }
+}
+
+/* ---------------------------
+   Click-to-drop markers (UI owns markers)
 ----------------------------*/
 let startMarker = null;
 let endMarker = null;
@@ -92,98 +320,76 @@ function clearMarkers() {
   endMarker = null;
 }
 
+function resetAll() {
+  clearMarkers();
+  clearRouteAndStats();
+  userMovedMap = false;
+}
+
+document.getElementById('btnNewRoute').addEventListener('click', resetAll);
+
 // left click sets start then end
 map.on('click', (e) => {
   const { lat, lng } = e.latlng;
 
   if (!startMarker) {
     startMarker = L.marker([lat, lng]).addTo(map).bindPopup("Start").openPopup();
-    console.log("Start chosen:", lat, lng);
     return;
   }
 
   if (!endMarker) {
     endMarker = L.marker([lat, lng]).addTo(map).bindPopup("End").openPopup();
-    console.log("End chosen:", lat, lng);
 
-    // NEXT STEP (later): call your backend here to reroute automatically
-    // Example we’ll do later:
-    // fetch(`/route?slat=${start.lat}&slon=${start.lng}&tlat=${end.lat}&tlon=${end.lng}`)
-    //   .then(r=>r.json()).then(drawGeoJSON)
+    const s = startMarker.getLatLng();
+
+    // New route: allow fitBounds (unless user already moved map before)
+    const doFit = !userMovedMap;
+    requestRouteFromBackend(s.lat, s.lng, lat, lng, { fit: doFit })
+      .catch(err => console.error("Route request failed:", err));
 
     return;
   }
 
-  // third click resets
-  clearMarkers();
+  resetAll();
 });
 
-// right click (contextmenu) clears markers
-map.on('contextmenu', () => {
-  clearMarkers();
-});
-/* ---------------------------
-   end markers code
-----------------------------*/
+// right click clears everything
+map.on('contextmenu', () => resetAll());
 
-// Holds current GeoJSON layer so we can replace later (for backend step)
-let geoLayer = null;
+// --- Slider: update simp_m live, and re-route if both markers exist ---
+let rerouteTimer = null;
+simpRange.addEventListener('input', () => {
+  SIMPLIFY_METERS = Number(simpRange.value) || 0;
+  simpValEl.textContent = String(SIMPLIFY_METERS);
 
-function drawGeoJSON(fc) {
-  if (geoLayer) map.removeLayer(geoLayer);
-
-  geoLayer = L.geoJSON(fc, {
-    style: (feature) => {
-      if (feature.geometry && feature.geometry.type === "LineString") {
-        return { color: 'red', weight: 5 };
-      }
-      return {};
-    },
-    pointToLayer: (feature, latlng) => L.marker(latlng)
-  }).addTo(map);
-
-  map.fitBounds(geoLayer.getBounds());
-
-  const routeFeature = (fc.features || []).find(f =>
-    f.geometry && f.geometry.type === "LineString"
-  );
-
-  if (routeFeature && routeFeature.properties) {
-    const p = routeFeature.properties;
-
-    document.getElementById('st_dist').textContent = fmtKm(Number(p.distance_km));
-    document.getElementById('st_hops').textContent = (p.hops ?? "—");
-    document.getElementById('st_runtime').textContent = fmtMs(Number(p.runtime_ms));
-    document.getElementById('st_start').textContent = (p.start_osm ?? "—");
-    document.getElementById('st_end').textContent = (p.end_osm ?? "—");
-
-    if (p.travel_time_min != null) {
-      document.getElementById('st_time').textContent = fmtMin(Number(p.travel_time_min));
-    } else if (p.travel_time_sec != null) {
-      document.getElementById('st_time').textContent = fmtMin(Number(p.travel_time_sec) / 60.0);
-    } else if (p.time_min != null) {
-      document.getElementById('st_time').textContent = fmtMin(Number(p.time_min));
-    } else if (p.time_sec != null) {
-      document.getElementById('st_time').textContent = fmtMin(Number(p.time_sec) / 60.0);
-    } else {
-      document.getElementById('st_time').textContent = "—";
-    }
-
-    document.getElementById('stats').style.display = "block";
-  } else {
-    console.warn("No LineString route feature found to extract stats.");
+  // Re-route WITHOUT refitting (so camera doesn’t jump while tuning)
+  if (startMarker && endMarker) {
+    if (rerouteTimer) clearTimeout(rerouteTimer);
+    rerouteTimer = setTimeout(() => {
+      const s = startMarker.getLatLng();
+      const e = endMarker.getLatLng();
+      requestRouteFromBackend(s.lat, s.lng, e.lat, e.lng, { fit: false })
+        .catch(err => console.error("Route request failed:", err));
+    }, 150);
   }
-}
+});
 
-// initial load (same as before)
+/* ---------------------------
+   Optional fallback initial load (route.geojson)
+   (This does NOT include slider; it’s just a “demo render” if server isn’t running)
+----------------------------*/
 fetch('route.geojson')
   .then(r => {
     if (!r.ok) throw new Error("HTTP " + r.status);
     return r.json();
   })
-  .then(fc => drawGeoJSON(fc))
-  .catch(err => console.error("Failed to load GeoJSON:", err));
+  .then(fc => {
+    // Draw fallback without fighting the user if they moved map
+    drawRouteOnly(fc, { fit: !userMovedMap });
+  })
+  .catch(() => {
+    // no fallback file / ignore
+  });
 </script>
-
 </body>
 </html>
