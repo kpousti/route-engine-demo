@@ -54,3 +54,5 @@ test.json
 # =========================
 *.swp
 *.tmp
+# Local backups
+_local_generated_backup/
